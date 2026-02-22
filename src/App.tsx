@@ -24,7 +24,7 @@ const TOTAL_ROUNDS = 5;
 type Player = { id: string; name: string; score: number; hasGuessed?: boolean };
 type ChatMsg = { id: string; text: string; type: "guess" | "system" | "correct" };
 type DrawData = { x0: number; y0: number; x1: number; y1: number; color: string; size: number };
-type GamePhase = "lobby" | "playing" | "roundEnd" | "gameOver";
+type GamePhase = "lobby" | "playing" | "roundEnd" | "gameOver" | "choosing";
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
