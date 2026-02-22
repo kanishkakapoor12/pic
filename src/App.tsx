@@ -84,8 +84,6 @@ export default function App() {
   useEffect(() => { drawerIdRef.current = drawerId; }, [drawerId]);
 
   const round = Math.floor(turn / Math.max(players.length, 1)) + 1;
-  const totalTurns = players.length * TOTAL_ROUNDS;
-
   // ── canvas init ──
   useEffect(() => {
     const canvas = canvasRef.current;
