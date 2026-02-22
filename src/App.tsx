@@ -33,7 +33,12 @@ export default function App() {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const [name, setName] = useState("");
-  const [me, setMe] = useState<Player | null>(null);
+  const [me, setMe] = useState<Player | null>(() => {
+    try {
+      const saved = localStorage.getItem("scribble_me");
+      return saved ? (JSON.parse(saved) as Player) : null;
+    } catch { return null; }
+  });
   const [players, setPlayers] = useState<Player[]>([]);
   const [drawerId, setDrawerId] = useState<string | null>(null);
   const [round, setRound] = useState(1);
@@ -86,9 +91,22 @@ export default function App() {
   const join = () => {
     if (!name.trim()) return;
     const player: Player = { id: crypto.randomUUID(), name: name.trim(), score: 0 };
+    localStorage.setItem("scribble_me", JSON.stringify(player));
     setMe(player);
     channel.publish("join", player);
   };
+
+  /* ── re-announce on reload if already logged in ── */
+  useEffect(() => {
+    const saved = localStorage.getItem("scribble_me");
+    if (!saved) return;
+    try {
+      const player = JSON.parse(saved) as Player;
+      // Re-broadcast presence so other clients re-add us to their player list
+      channel.publish("join", player);
+    } catch { /* ignore corrupt storage */ }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // only on mount
 
   /* ── ably subscription ── */
   useEffect(() => {
@@ -124,8 +142,11 @@ export default function App() {
       }
 
       if (msg.name === "wordChoices") {
-        setMe((m) => m && m.id === d.drawerId ? m : m);
-        if (d.drawerId) setWordChoices(d.words);
+        // Only show word choices to the actual drawer — everyone else keeps seeing the canvas
+        setMe((m) => {
+          if (m && m.id === d.drawerId) setWordChoices(d.words);
+          return m;
+        });
       }
     });
 
@@ -367,7 +388,7 @@ export default function App() {
   const isDrawer = me.id === drawerId;
   const drawerName = players.find((p) => p.id === drawerId)?.name;
 
-  /* ── word choosing screen ── */
+  /* ── word choosing screen (drawer only) ── */
   if (phase === "choosing" && isDrawer && wordChoices.length > 0) {
     return (
       <div style={styles.lobby}>
@@ -407,6 +428,11 @@ export default function App() {
       {/* Word display */}
       {!isDrawer && phase === "playing" && (
         <div style={styles.wordDisplay}>{maskedWord || "Waiting..."}</div>
+      )}
+      {!isDrawer && phase === "choosing" && (
+        <div style={{ ...styles.wordDisplay, color: "#aaa", letterSpacing: 1, fontSize: 15 }}>
+          ⏳ {drawerName} is choosing a word...
+        </div>
       )}
       {isDrawer && word && phase === "playing" && (
         <div style={styles.wordDisplay}>
