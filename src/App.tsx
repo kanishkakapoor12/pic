@@ -48,6 +48,11 @@ export default function App() {
   const turnRef      = useRef(0);
   const timerRef     = useRef<ReturnType<typeof setInterval> | null>(null);
   const chatEndRef   = useRef<HTMLDivElement>(null);
+  // Bug 3: keep latest guess/word/timer/drawerId accessible without stale closure
+  const guessRef     = useRef("");
+  const wordRef      = useRef<string | null>(null);
+  const timerValRef  = useRef(ROUND_TIME);
+  const phaseRef     = useRef<Phase>("lobby");
 
   // ── React state (drives UI re-renders) ──
   const [name, setName]       = useState("");
@@ -75,6 +80,10 @@ export default function App() {
   useEffect(() => { drawerIdRef.current = drawerId; }, [drawerId]);
   useEffect(() => { playersRef.current = players; }, [players]);
   useEffect(() => { turnRef.current = turn; }, [turn]);
+  useEffect(() => { guessRef.current = guess; }, [guess]);
+  useEffect(() => { wordRef.current = word; }, [word]);
+  useEffect(() => { timerValRef.current = timer; }, [timer]);
+  useEffect(() => { phaseRef.current = phase; }, [phase]);
 
   const round = Math.floor(turn / Math.max(players.length, 1)) + 1;
 
@@ -110,25 +119,32 @@ export default function App() {
     const onMove = (e: PointerEvent) => {
       if (!isDrawingRef.current || meRef.current?.id !== drawerIdRef.current) return;
       e.preventDefault();
-      const pos  = getPos(e);
-      const prev = lastPosRef.current;
-      if (!prev) { lastPosRef.current = pos; return; }
 
-      const ctx   = ctxRef.current!;
-      const col   = eraserRef.current ? "#ffffff" : colorRef.current;
-      const width = eraserRef.current ? sizeRef.current * 3 : sizeRef.current;
+      // Bug 2 fix: getCoalescedEvents gives every intermediate position the browser
+      // batched between frames — prevents line gaps when drawing fast
+      const events = e.getCoalescedEvents?.() ?? [e];
 
-      ctx.strokeStyle = col;
-      ctx.lineWidth   = width;
-      ctx.lineCap     = "round";
-      ctx.lineJoin    = "round";
-      ctx.beginPath();
-      ctx.moveTo(prev.x, prev.y);
-      ctx.lineTo(pos.x,  pos.y);
-      ctx.stroke();
+      for (const ce of events) {
+        const pos  = getPos(ce);
+        const prev = lastPosRef.current;
+        if (!prev) { lastPosRef.current = pos; continue; }
 
-      channel.publish("draw", { x0: prev.x, y0: prev.y, x1: pos.x, y1: pos.y, color: col, size: width });
-      lastPosRef.current = pos;
+        const ctx   = ctxRef.current!;
+        const col   = eraserRef.current ? "#ffffff" : colorRef.current;
+        const width = eraserRef.current ? sizeRef.current * 3 : sizeRef.current;
+
+        ctx.strokeStyle = col;
+        ctx.lineWidth   = width;
+        ctx.lineCap     = "round";
+        ctx.lineJoin    = "round";
+        ctx.beginPath();
+        ctx.moveTo(prev.x, prev.y);
+        ctx.lineTo(pos.x,  pos.y);
+        ctx.stroke();
+
+        channel.publish("draw", { x0: prev.x, y0: prev.y, x1: pos.x, y1: pos.y, color: col, size: width });
+        lastPosRef.current = pos;
+      }
     };
 
     const onUp = (e: PointerEvent) => {
@@ -165,6 +181,8 @@ export default function App() {
     meRef.current = player;
     setMe(player);
     channel.publish("join", player);
+    // Bug 1 fix: ask existing clients to send us the current game state
+    channel.publish("requestSync", { requesterId: player.id });
   };
 
   // ── Re-announce on reload ──
@@ -175,6 +193,8 @@ export default function App() {
       const p = JSON.parse(saved) as Player;
       meRef.current = p;
       channel.publish("join", p);
+      // Bug 1 fix: ask existing clients to broadcast current game state
+      channel.publish("requestSync", { requesterId: p.id });
     } catch { /* ignore */ }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -195,6 +215,40 @@ export default function App() {
       if (msg.name === "join") {
         setPlayers(p => p.find(x => x.id === d.id) ? p : [...p, d]);
         setChat(c => [...c, { id: crypto.randomUUID(), text: `${d.name} joined`, type: "system" as const }]);
+      }
+
+      // Bug 1 fix: when a new player requests sync, one existing client responds
+      // with the full current state so the joiner sees everyone + game in progress.
+      // Only the first client alphabetically by id responds to avoid duplicate floods.
+      if (msg.name === "requestSync") {
+        const me = meRef.current;
+        const allPlayers = playersRef.current;
+        // Respond only if we are already in the game and we have state worth sharing
+        if (!me || allPlayers.length === 0) return;
+        // Pick one responder deterministically: lowest player id responds
+        const sorted = [...allPlayers].sort((a, b) => a.id.localeCompare(b.id));
+        if (sorted[0]?.id !== me.id) return; // not our turn to respond
+        channel.publish("syncState", {
+          players:   allPlayers,
+          drawerId:  drawerIdRef.current,
+          turn:      turnRef.current,
+          phase:     phaseRef.current,
+          timer:     timerValRef.current,
+          // Don't send the secret word to everyone — only the drawer knows it
+          // Receivers will get it from the next state broadcast if they are the drawer
+        });
+      }
+
+      // Bug 1 fix: apply the synced state when we receive it
+      if (msg.name === "syncState") {
+        // Only apply if we don't already have players (we are the new joiner)
+        if (playersRef.current.length <= 1) {
+          setPlayers(d.players);
+          setDrawerId(d.drawerId);
+          setTurn(d.turn ?? 0);
+          setTimer(d.timer ?? ROUND_TIME);
+          setPhase(d.phase ?? "lobby");
+        }
       }
 
       if (msg.name === "state") {
@@ -295,18 +349,39 @@ export default function App() {
   };
 
   // ── Guess ──
+  // Bug 3 fix: read all values from refs so this function is never stale —
+  // the Enter-key onKeyDown handler calls this without recreating it every render
   const submitGuess = () => {
-    if (!word || !me || me.id === drawerId || !guess.trim()) return;
-    if (guess.trim().toLowerCase() === word.toLowerCase()) {
-      const pts = Math.max(10, Math.ceil((timer / ROUND_TIME) * 100));
-      const updated = players.map(p => p.id === me.id ? { ...p, score: p.score + pts, hasGuessed: true } : p);
-      channel.publish("chat", { id: crypto.randomUUID(), text: `🎉 ${me.name} guessed it! (+${pts} pts)`, type: "correct" });
-      channel.publish("state", { players: updated, drawerId, turn, word, maskedWord: word.split("").join(" "), timer, phase: "playing" });
-      const nonDrawers = updated.filter(p => p.id !== drawerId);
+    const currentGuess    = guessRef.current.trim();
+    const currentWord     = wordRef.current;
+    const currentMe       = meRef.current;
+    const currentDrawerId = drawerIdRef.current;
+    const currentPlayers  = playersRef.current;
+    const currentTurn     = turnRef.current;
+    const currentTimer    = timerValRef.current;
+
+    if (!currentWord || !currentMe || currentMe.id === currentDrawerId || !currentGuess) return;
+
+    if (currentGuess.toLowerCase() === currentWord.toLowerCase()) {
+      const pts = Math.max(10, Math.ceil((currentTimer / ROUND_TIME) * 100));
+      const updated = currentPlayers.map(p =>
+        p.id === currentMe.id ? { ...p, score: p.score + pts, hasGuessed: true } : p
+      );
+      channel.publish("chat", { id: crypto.randomUUID(), text: `🎉 ${currentMe.name} guessed it! (+${pts} pts)`, type: "correct" });
+      channel.publish("state", {
+        players: updated, drawerId: currentDrawerId, turn: currentTurn,
+        word: currentWord, maskedWord: currentWord.split("").join(" "),
+        timer: currentTimer, phase: "playing",
+      });
+      const nonDrawers = updated.filter(p => p.id !== currentDrawerId);
       if (nonDrawers.length > 0 && nonDrawers.every(p => p.hasGuessed))
-        channel.publish("allGuessed", { players: updated, turn });
+        channel.publish("allGuessed", { players: updated, turn: currentTurn });
     } else {
-      channel.publish("chat", { id: crypto.randomUUID(), text: `${me.name}: ${guess.trim()}`, type: "guess" });
+      channel.publish("chat", {
+        id: crypto.randomUUID(),
+        text: `${currentMe.name}: ${currentGuess}`,
+        type: "guess",
+      });
     }
     setGuess("");
   };
